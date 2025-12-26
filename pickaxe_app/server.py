@@ -389,43 +389,60 @@ def create_app() -> FastAPI:
             )
 
     @app.get("/api/config")
-    def api_get_config() -> Dict[str, Any]:
+    def api_get_config(
+        include_secrets: bool = False, _auth: None = Depends(require_local_auth)
+    ) -> Dict[str, Any]:
         cfg = load_config(None)
+        config_payload: Dict[str, Any] = {
+            "site_id": cfg.site_id,
+            "site_name": cfg.site_name,
+            "cloud_api_base": cfg.cloud_api_base,
+            # v0.2+: two-loop polling strategy
+            "latest_interval_sec": cfg.latest_interval_sec,
+            "raw_interval_sec": cfg.raw_interval_sec,
+            # backward compatible alias (UI may still show poll_interval_sec)
+            "poll_interval_sec": cfg.poll_interval_sec,
+            "timeout_sec": cfg.timeout_sec,
+            "max_retries": cfg.max_retries,
+            "max_workers": cfg.max_workers,
+            "batch_size": cfg.batch_size,
+            "upload_connect_timeout_sec": cfg.upload_connect_timeout_sec,
+            "upload_read_timeout_sec": cfg.upload_read_timeout_sec,
+            "upload_workers": cfg.upload_workers,
+            "latest_max_miners": cfg.latest_max_miners,
+            "shard_total": cfg.shard_total,
+            "shard_index": cfg.shard_index,
+            "miner_timeout_fast_sec": cfg.miner_timeout_fast_sec,
+            "miner_timeout_slow_sec": cfg.miner_timeout_slow_sec,
+            "offline_backoff_base_sec": cfg.offline_backoff_base_sec,
+            "offline_backoff_max_sec": cfg.offline_backoff_max_sec,
+            "enable_commands": cfg.enable_commands,
+            "command_poll_interval_sec": cfg.command_poll_interval_sec,
+            "upload_ip_to_cloud": cfg.upload_ip_to_cloud,
+            "encrypt_miners_config": cfg.encrypt_miners_config,
+            "local_key_env": cfg.local_key_env,
+            "miners": [m.__dict__ for m in cfg.miners],
+            "ip_ranges": cfg.ip_ranges,
+        }
+
+        if include_secrets:
+            config_payload.update(
+                {
+                    "collector_token": cfg.collector_token,
+                    "local_api_secret": cfg.local_api_secret,
+                }
+            )
+        else:
+            config_payload.update(
+                {
+                    "collector_token_set": bool(cfg.collector_token),
+                    "local_api_secret_set": bool(cfg.local_api_secret or _get_local_api_secret()),
+                }
+            )
+
         return {
             "warnings": get_last_warnings(),
-            "config": {
-                "site_id": cfg.site_id,
-                "site_name": cfg.site_name,
-                "cloud_api_base": cfg.cloud_api_base,
-                "collector_token": cfg.collector_token,
-                # v0.2+: two-loop polling strategy
-                "latest_interval_sec": cfg.latest_interval_sec,
-                "raw_interval_sec": cfg.raw_interval_sec,
-                # backward compatible alias (UI may still show poll_interval_sec)
-                "poll_interval_sec": cfg.poll_interval_sec,
-                "timeout_sec": cfg.timeout_sec,
-                "max_retries": cfg.max_retries,
-                "max_workers": cfg.max_workers,
-                "batch_size": cfg.batch_size,
-                "upload_connect_timeout_sec": cfg.upload_connect_timeout_sec,
-                "upload_read_timeout_sec": cfg.upload_read_timeout_sec,
-                "upload_workers": cfg.upload_workers,
-                "latest_max_miners": cfg.latest_max_miners,
-                "shard_total": cfg.shard_total,
-                "shard_index": cfg.shard_index,
-                "miner_timeout_fast_sec": cfg.miner_timeout_fast_sec,
-                "miner_timeout_slow_sec": cfg.miner_timeout_slow_sec,
-                "offline_backoff_base_sec": cfg.offline_backoff_base_sec,
-                "offline_backoff_max_sec": cfg.offline_backoff_max_sec,
-                "enable_commands": cfg.enable_commands,
-                "command_poll_interval_sec": cfg.command_poll_interval_sec,
-                "upload_ip_to_cloud": cfg.upload_ip_to_cloud,
-                "encrypt_miners_config": cfg.encrypt_miners_config,
-                "local_key_env": cfg.local_key_env,
-                "local_api_secret": cfg.local_api_secret,
-                "miners": [m.__dict__ for m in cfg.miners],
-                "ip_ranges": cfg.ip_ranges,
-            },
+            "config": config_payload,
             "limits": {
                 "min_latest_interval_sec": MIN_LATEST_INTERVAL_SEC,
                 "min_raw_interval_sec": MIN_RAW_INTERVAL_SEC,
@@ -433,7 +450,7 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/config")
-    def api_save_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def api_save_config(payload: Dict[str, Any], _auth: None = Depends(require_local_auth)) -> Dict[str, Any]:
         raw = payload.get("config")
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail="Missing config")
