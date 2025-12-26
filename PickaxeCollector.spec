@@ -1,42 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.building.datastruct import Tree
 
 block_cipher = None
 
-REPO_ROOT = Path(__file__).resolve().parent
+# Robust repo root detection for GitHub Actions & local runs
+REPO_ROOT = Path.cwd()
+try:
+    if "__file__" in globals():
+        REPO_ROOT = Path(__file__).resolve().parent
+except Exception:
+    REPO_ROOT = Path.cwd()
 
-# IMPORTANT:
-# If your entry is different, change this line.
 ENTRY = str(REPO_ROOT / "pickaxe_app" / "__main__.py")
 
-if not Path(ENTRY).exists():
-    raise SystemExit(
-        f"[PickaxeCollector.spec] ENTRY not found: {ENTRY}\n"
-        "Fix: update ENTRY to your real server entry (e.g. pickaxe_app/main.py or server.py)."
-    )
-
-# Include static assets if present
-datas = []
-for rel in [
-    ("pickaxe_app/web", "pickaxe_app/web"),
-    ("pickaxe_app/templates", "pickaxe_app/templates"),
-    ("pickaxe_app/static", "pickaxe_app/static"),
-]:
-    src = REPO_ROOT / rel[0]
-    if src.exists():
-        datas.append((str(src), rel[1]))
-
-# Hidden imports for FastAPI/Uvicorn
-hiddenimports = [
-    "fastapi",
-    "uvicorn",
-    "uvicorn.logging",
-    "uvicorn.protocols.http.h11_impl",
-    "uvicorn.protocols.websockets.websockets_impl",
+# Bundle UI assets (FastAPI mounts StaticFiles from pickaxe_app/web/static)
+datas = [
+    Tree(str(REPO_ROOT / "pickaxe_app" / "web"), prefix="pickaxe_app/web"),
 ]
 
-from PyInstaller.utils.hooks import collect_submodules
+hiddenimports = []
 hiddenimports += collect_submodules("fastapi")
+hiddenimports += collect_submodules("starlette")
+hiddenimports += collect_submodules("pydantic")
 hiddenimports += collect_submodules("uvicorn")
 
 a = Analysis(
@@ -46,9 +35,10 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    hooksconfig={},
     runtime_hooks=[],
     excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
@@ -68,15 +58,4 @@ exe = EXE(
     strip=False,
     upx=True,
     console=True,
-    disable_windowed_traceback=False,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    name="PickaxeCollector",
 )
