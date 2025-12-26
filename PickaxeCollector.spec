@@ -7,26 +7,18 @@ from PyInstaller.building.datastruct import Tree
 
 block_cipher = None
 
-# Robust repo root detection for GitHub Actions & local runs
 REPO_ROOT = Path.cwd()
-try:
-    if "__file__" in globals():
-        REPO_ROOT = Path(__file__).resolve().parent
-except Exception:
-    REPO_ROOT = Path.cwd()
-
 ENTRY = str(REPO_ROOT / "pickaxe_app" / "__main__.py")
 
-# Bundle UI assets (FastAPI mounts StaticFiles from pickaxe_app/web/static)
 datas = [
-    Tree(str(REPO_ROOT / "pickaxe_app" / "web"), prefix="pickaxe_app/web"),
+    (str(REPO_ROOT / "pickaxe_app" / "web"), "pickaxe_app/web"),
 ]
 
 hiddenimports = []
 hiddenimports += collect_submodules("fastapi")
 hiddenimports += collect_submodules("starlette")
-hiddenimports += collect_submodules("pydantic")
 hiddenimports += collect_submodules("uvicorn")
+hiddenimports += collect_submodules("pydantic")
 
 a = Analysis(
     [ENTRY],
@@ -54,7 +46,6 @@ exe = EXE(
     [],
     name="PickaxeCollector",
     debug=False,
-    bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     console=True,
