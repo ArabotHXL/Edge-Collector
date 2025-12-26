@@ -5,23 +5,30 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.building.datastruct import Tree
 
+# -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
-REPO_ROOT = Path.cwd()
-ENTRY = str(REPO_ROOT / "pickaxe_app" / "__main__.py")
+REPO_ROOT = Path(globals().get("SPECPATH", ".")).resolve()
+
+ENTRY = REPO_ROOT / "collector_entry.py"
+if not ENTRY.exists():
+    raise SystemExit(f"Missing {ENTRY}. Add collector_entry.py at repo root.")
 
 datas = [
     (str(REPO_ROOT / "pickaxe_app" / "web"), "pickaxe_app/web"),
 ]
 
 hiddenimports = []
+hiddenimports += collect_submodules("pickaxe_app")
+hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("fastapi")
 hiddenimports += collect_submodules("starlette")
-hiddenimports += collect_submodules("uvicorn")
-hiddenimports += collect_submodules("pydantic")
 
 a = Analysis(
-    [ENTRY],
+    [str(ENTRY)],
     pathex=[str(REPO_ROOT)],
     binaries=[],
     datas=datas,
@@ -29,8 +36,6 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
@@ -45,8 +50,6 @@ exe = EXE(
     a.datas,
     [],
     name="PickaxeCollector",
-    debug=False,
-    strip=False,
-    upx=True,
     console=True,
+    upx=True,
 )
