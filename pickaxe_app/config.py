@@ -64,6 +64,8 @@ class AppConfig:
     cloud_api_base: str = "https://calc.hashinsight.net"
     collector_token: str = ""
 
+    # Local API auth secret (protects start/stop/save operations). Stored locally.
+    local_api_secret: str = ""
     # Polling
     latest_interval_sec: int = DEFAULT_LATEST_INTERVAL_SEC
     raw_interval_sec: int = DEFAULT_RAW_INTERVAL_SEC
@@ -105,8 +107,6 @@ class AppConfig:
     # Privacy: whether to include miner IP address in uploads to the cloud
     upload_ip_to_cloud: bool = False
     local_key_env: str = DEFAULT_KEY_ENV
-    # Local API auth (protects start/stop/status/logs endpoints)
-    local_api_secret: str = ""
 
     # Miner sources
     miners: List[MinerConfig] = None  # type: ignore
@@ -171,6 +171,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         site_name=str(raw.get("site_name", "")),
         cloud_api_base=cloud_api_base,
         collector_token=collector_token,
+        local_api_secret=str(raw.get("local_api_secret", raw.get("local_api_key", ""))),
         latest_interval_sec=int(raw.get("latest_interval_sec", raw.get("poll_interval_sec", DEFAULT_LATEST_INTERVAL_SEC))),
         raw_interval_sec=int(raw.get("raw_interval_sec", raw.get("poll_interval_sec", DEFAULT_RAW_INTERVAL_SEC))),
         poll_interval_sec=int(raw.get("poll_interval_sec", raw.get("latest_interval_sec", DEFAULT_POLL_INTERVAL_SEC))),
@@ -197,7 +198,6 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         encrypt_miners_config=bool(raw.get("encrypt_miners_config", False)),
         upload_ip_to_cloud=bool(raw.get("upload_ip_to_cloud", False)),
         local_key_env=str(raw.get("local_key_env") or DEFAULT_KEY_ENV),
-        local_api_secret=str(raw.get("local_api_secret", "")),
         ip_ranges=raw.get("ip_ranges") or [],
     )
 

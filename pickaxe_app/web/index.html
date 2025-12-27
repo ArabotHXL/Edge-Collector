@@ -255,6 +255,17 @@
         <label>Collector Token</label>
         <input id="collector_token" placeholder="hsc_..."/>
 
+        <label>Local API Secret</label>
+        <div class="row">
+          <div class="col" style="flex: 1;">
+            <input id="local_api_secret" type="password" placeholder="Set once to secure local controls (Save/Start/Stop)"/>
+          </div>
+          <button class="btn" id="btn_set_secret" type="button">Set</button>
+          <button class="btn" id="btn_gen_secret" type="button">Generate</button>
+        </div>
+        <div class="muted" id="local_secret_hint" style="margin-top:6px;"></div>
+
+
         <div class="row">
           <div class="col">
             <label>Latest Interval (sec)</label>
@@ -326,14 +337,6 @@
             <div class="col">
               <label>Local Key Env Var Name</label>
               <input id="local_key_env" placeholder="PICKAXE_LOCAL_KEY"/>
-            </div>
-          </div>
-
-          <div class="row">
-            <div class="col">
-              <label>Local API Secret (protects Start/Stop/Status/Logs)</label>
-              <input id="local_api_secret" placeholder="set a long random string" />
-              <div class="muted" style="margin-top:4px;">Header: Authorization: Bearer &lt;secret&gt;. Leave blank to configure via env PICKAXE_LOCAL_SECRET.</div>
             </div>
           </div>
 

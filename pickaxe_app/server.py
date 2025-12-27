@@ -1,13 +1,14 @@
 import json
 import logging
 import os
+import secrets
 import io
 import csv
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from . import __version__
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +24,50 @@ from .config import (
     MIN_LATEST_INTERVAL_SEC,
     MIN_RAW_INTERVAL_SEC,
 )
+
+# ---------------------------
+# Local API authentication (UI -> Local API)
+# ---------------------------
+LOCAL_SECRET_HEADER = "X-Local-API-Secret"
+LOCAL_SECRET_ENV = "PICKAXE_LOCAL_API_SECRET"
+LOCAL_SECRET_MIN_LEN = 16
+
+def _get_local_secret(cfg_obj) -> str:
+    try:
+        sec = getattr(cfg_obj, "local_api_secret", "") or ""
+    except Exception:
+        sec = ""
+    sec = (sec or "").strip()
+    if not sec:
+        sec = (os.getenv(LOCAL_SECRET_ENV, "") or "").strip()
+    return sec
+
+def _is_loopback(req: Request) -> bool:
+    try:
+        host = req.client.host if req.client else ""
+    except Exception:
+        host = ""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+def _require_local_secret(req: Request):
+    cfg_dict = load_config()
+    cfg_obj = AppConfig(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict
+    secret = _get_local_secret(cfg_obj)
+    if not secret:
+        raise HTTPException(status_code=400, detail="Local API secret is not configured")
+    provided = (req.headers.get(LOCAL_SECRET_HEADER, "") or "").strip()
+    if not provided:
+        auth = (req.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if provided != secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def _safe_config_payload(cfg_obj) -> dict:
+    d = cfg_obj.__dict__.copy() if hasattr(cfg_obj, "__dict__") else dict(cfg_obj)
+    d.pop("local_api_secret", None)
+    d["local_api_secret_configured"] = bool(_get_local_secret(cfg_obj))
+    return d
 from .logging_setup import setup_logging
 from .runtime import CollectorRunner
 from .vendor_edge_collector.cgminer_client import CGMinerClient, CGMinerError
@@ -141,62 +186,6 @@ def _normalize_miner_rows(rows: List[List[str]], defaults: Dict[str, Any]) -> Li
 
 logger = logging.getLogger("PickaxeLocalAPI")
 
-MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
-_IMPORT_EXT_TYPE_MAP = {
-    ".csv": "csv",
-    ".txt": "csv",
-    ".xlsx": "xlsx",
-    ".xlsm": "xlsx",
-    ".xltx": "xlsx",
-}
-_IMPORT_CONTENT_TYPE_MAP = {
-    "text/csv": "csv",
-    "text/plain": "csv",
-    "application/vnd.ms-excel": "csv",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
-    "application/vnd.ms-excel.sheet.macroenabled.12": "xlsx",
-}
-
-
-def _validate_import_file(file: UploadFile) -> str:
-    name = (file.filename or "").lower()
-    ext = Path(name).suffix
-    ext_type = _IMPORT_EXT_TYPE_MAP.get(ext)
-    if not ext_type:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use .csv or .xlsx")
-
-    content_type = (file.content_type or "").split(";")[0].strip()
-    if content_type:
-        ct_type = _IMPORT_CONTENT_TYPE_MAP.get(content_type)
-        if ct_type is None:
-            raise HTTPException(status_code=400, detail="Unsupported content type. Use CSV or XLSX.")
-        if ct_type != ext_type:
-            raise HTTPException(status_code=400, detail="File extension/content type mismatch. Use CSV or XLSX.")
-
-    return ext_type
-
-
-async def _read_upload_file_chunks(file: UploadFile, max_bytes: int = MAX_IMPORT_FILE_BYTES) -> bytes:
-    total = 0
-    chunks: List[bytes] = []
-    chunk_size = 1024 * 1024
-
-    while True:
-        chunk = await file.read(chunk_size)
-        if not chunk:
-            break
-
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(status_code=413, detail="File too large. Maximum 5 MB allowed.")
-
-        chunks.append(chunk)
-
-    data = b"".join(chunks)
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-    return data
-
 
 def _data_dir() -> Path:
     return get_config_path(None).parent
@@ -222,62 +211,6 @@ def tail_file(path: Path, lines: int = 200) -> str:
         return "\n".join(out)
     except Exception:
         return ""
-
-
-def _get_local_api_secret() -> str:
-    """Return the configured local API secret, preferring env override."""
-
-    env_secret = os.getenv("PICKAXE_LOCAL_SECRET", "").strip()
-    if env_secret:
-        return env_secret
-
-    try:
-        cfg = load_config(None)
-        return (cfg.local_api_secret or "").strip()
-    except Exception:
-        return ""
-
-
-def _requires_csrf_check(request: Request) -> bool:
-    # If the request originates from a browser context, enforce a CSRF token header
-    # to mitigate cross-site POSTs even when the secret is known to the page.
-    return bool(request.headers.get("Origin") or request.headers.get("Referer"))
-
-
-def require_local_auth(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None),
-    x_local_secret: Optional[str] = Header(None),
-    x_csrf_token: Optional[str] = Header(None),
-) -> None:
-    secret = _get_local_api_secret()
-    if not secret:
-        raise HTTPException(status_code=401, detail="Local API secret is not configured")
-
-    candidate = ""
-    if authorization:
-        auth = authorization.strip()
-        if auth.lower().startswith("bearer "):
-            candidate = auth[7:].strip()
-    if not candidate and x_api_key:
-        candidate = x_api_key.strip()
-    if not candidate and x_local_secret:
-        candidate = x_local_secret.strip()
-
-    if not candidate:
-        raise HTTPException(status_code=401, detail="Missing credentials")
-    if candidate != secret:
-        raise HTTPException(status_code=403, detail="Invalid credentials")
-
-    if _requires_csrf_check(request):
-        csrf = (x_csrf_token or "").strip()
-        if not csrf:
-            csrf = (request.headers.get("X-CSRF-Token") or "").strip()
-        if not csrf:
-            raise HTTPException(status_code=403, detail="Missing CSRF token")
-        if csrf != secret:
-            raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 
 def create_app() -> FastAPI:
@@ -309,6 +242,41 @@ def create_app() -> FastAPI:
     def legacy_app_js_alias() -> Response:
         return legacy_app_js()
 
+
+    # --- Local API Secret bootstrap ---
+    @app.get("/api/local-secret")
+    def api_local_secret_status():
+        cfg_dict = load_config()
+        cfg_obj = AppConfig(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict
+        return {"configured": bool(_get_local_secret(cfg_obj))}
+
+    @app.post("/api/local-secret")
+    def api_local_secret_set(payload: Dict[str, Any], req: Request):
+        # Restrict bootstrap to loopback.
+        if not _is_loopback(req):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        cfg_dict = load_config()
+        cfg_obj = AppConfig(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict
+        current = _get_local_secret(cfg_obj)
+
+        # If already configured, require existing secret to rotate.
+        if current:
+            provided = (req.headers.get(LOCAL_SECRET_HEADER, "") or "").strip()
+            if provided != current:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+
+        if bool(payload.get("generate")):
+            new_secret = secrets.token_urlsafe(32)
+        else:
+            new_secret = str(payload.get("secret") or "").strip()
+            if len(new_secret) < LOCAL_SECRET_MIN_LEN:
+                raise HTTPException(status_code=400, detail=f"Secret too short (min {LOCAL_SECRET_MIN_LEN})")
+
+        cfg_obj.local_api_secret = new_secret
+        save_config(cfg_obj)
+        return {"configured": True, "secret": new_secret}
+
     @app.get("/api/version")
     def version() -> Dict[str, Any]:
         return {
@@ -339,27 +307,21 @@ def create_app() -> FastAPI:
             Expected columns (any order, header optional): miner_id, ip, port, type
             If only a single column is present, it's treated as ip or ip:port.
             """
-            ext_type = _validate_import_file(file)
-
-            header_length = file.headers.get("content-length") if file.headers else None
-            if header_length:
-                try:
-                    if int(header_length) > MAX_IMPORT_FILE_BYTES:
-                        raise HTTPException(status_code=413, detail="File too large. Maximum 5 MB allowed.")
-                except ValueError:
-                    pass
-            content = await _read_upload_file_chunks(file)
+            name = (file.filename or "").lower()
+            content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Empty file")
 
             defaults = {"port": default_port, "type": default_type, "id_prefix": id_prefix}
 
             rows: List[List[str]] = []
             try:
-                if ext_type == "csv":
+                if name.endswith(".csv") or name.endswith(".txt"):
                     text = content.decode("utf-8", errors="ignore")
                     reader = csv.reader(io.StringIO(text))
                     for r in reader:
                         rows.append([c for c in r])
-                elif ext_type == "xlsx":
+                elif name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xltx"):
                     try:
                         from openpyxl import load_workbook
                     except Exception as e:
@@ -388,176 +350,122 @@ def create_app() -> FastAPI:
                 detail='File upload requires "python-multipart". Install it with: pip install python-multipart',
             )
 
-    @app.get("/api/config", dependencies=[Depends(require_local_auth)])
-    def api_get_config(include_secrets: bool = False) -> Dict[str, Any]:
+    @app.get("/api/config")
+    def api_get_config() -> Dict[str, Any]:
         cfg = load_config(None)
-        config_payload: Dict[str, Any] = {
-            "site_id": cfg.site_id,
-            "site_name": cfg.site_name,
-            "cloud_api_base": cfg.cloud_api_base,
-            # v0.2+: two-loop polling strategy
-            "latest_interval_sec": cfg.latest_interval_sec,
-            "raw_interval_sec": cfg.raw_interval_sec,
-            # backward compatible alias (UI may still show poll_interval_sec)
-            "poll_interval_sec": cfg.poll_interval_sec,
-            "timeout_sec": cfg.timeout_sec,
-            "max_retries": cfg.max_retries,
-            "max_workers": cfg.max_workers,
-            "batch_size": cfg.batch_size,
-            "upload_connect_timeout_sec": cfg.upload_connect_timeout_sec,
-            "upload_read_timeout_sec": cfg.upload_read_timeout_sec,
-            "upload_workers": cfg.upload_workers,
-            "latest_max_miners": cfg.latest_max_miners,
-            "shard_total": cfg.shard_total,
-            "shard_index": cfg.shard_index,
-            "miner_timeout_fast_sec": cfg.miner_timeout_fast_sec,
-            "miner_timeout_slow_sec": cfg.miner_timeout_slow_sec,
-            "offline_backoff_base_sec": cfg.offline_backoff_base_sec,
-            "offline_backoff_max_sec": cfg.offline_backoff_max_sec,
-            "enable_commands": cfg.enable_commands,
-            "command_poll_interval_sec": cfg.command_poll_interval_sec,
-            "upload_ip_to_cloud": cfg.upload_ip_to_cloud,
-            "encrypt_miners_config": cfg.encrypt_miners_config,
-            "local_key_env": cfg.local_key_env,
-            "miners": [m.__dict__ for m in cfg.miners],
-            "ip_ranges": cfg.ip_ranges,
-        }
-
-        if include_secrets is True:
-            config_payload.update(
-                {
-                    "collector_token": cfg.collector_token,
-                    "local_api_secret": cfg.local_api_secret,
-                }
-            )
-        else:
-            config_payload.update(
-                {
-                    "collector_token_set": bool(cfg.collector_token),
-                    "local_api_secret_set": bool(cfg.local_api_secret or _get_local_api_secret()),
-                }
-            )
-
         return {
             "warnings": get_last_warnings(),
-            "config": config_payload,
+            "config": {
+                "site_id": cfg.site_id,
+                "site_name": cfg.site_name,
+                "cloud_api_base": cfg.cloud_api_base,
+                "collector_token": cfg.collector_token,
+                # v0.2+: two-loop polling strategy
+                "latest_interval_sec": cfg.latest_interval_sec,
+                "raw_interval_sec": cfg.raw_interval_sec,
+                # backward compatible alias (UI may still show poll_interval_sec)
+                "poll_interval_sec": cfg.poll_interval_sec,
+                "timeout_sec": cfg.timeout_sec,
+                "max_retries": cfg.max_retries,
+                "max_workers": cfg.max_workers,
+                "batch_size": cfg.batch_size,
+                "upload_connect_timeout_sec": cfg.upload_connect_timeout_sec,
+                "upload_read_timeout_sec": cfg.upload_read_timeout_sec,
+                "upload_workers": cfg.upload_workers,
+                "latest_max_miners": cfg.latest_max_miners,
+                "shard_total": cfg.shard_total,
+                "shard_index": cfg.shard_index,
+                "miner_timeout_fast_sec": cfg.miner_timeout_fast_sec,
+                "miner_timeout_slow_sec": cfg.miner_timeout_slow_sec,
+                "offline_backoff_base_sec": cfg.offline_backoff_base_sec,
+                "offline_backoff_max_sec": cfg.offline_backoff_max_sec,
+                "enable_commands": cfg.enable_commands,
+                "command_poll_interval_sec": cfg.command_poll_interval_sec,
+                "upload_ip_to_cloud": cfg.upload_ip_to_cloud,
+                "encrypt_miners_config": cfg.encrypt_miners_config,
+                "local_key_env": cfg.local_key_env,
+                "miners": [m.__dict__ for m in cfg.miners],
+                "ip_ranges": cfg.ip_ranges,
+            },
             "limits": {
                 "min_latest_interval_sec": MIN_LATEST_INTERVAL_SEC,
                 "min_raw_interval_sec": MIN_RAW_INTERVAL_SEC,
             },
         }
 
-    @app.post("/api/config", dependencies=[Depends(require_local_auth)])
-    def api_save_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    @app.post("/api/config")
+    def api_save_config(payload: Dict[str, Any], req: Request) -> Dict[str, Any]:
         raw = payload.get("config")
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail="Missing config")
 
-        existing_cfg = load_config(None)
-
-        def _as_bool(value: Any) -> bool:
-            return value in (True, "true", "True", 1, "1", "yes", "on")
-
-        def _as_positive_int(value: Any, default: int, minimum: int = 0) -> int:
-            try:
-                parsed = int(value)
-            except Exception:
-                return default
-            return max(parsed, minimum)
-
-        def _as_positive_float(value: Any, default: float, minimum: float = 0.0) -> float:
-            try:
-                parsed = float(value)
-            except Exception:
-                return default
-            return max(parsed, minimum)
+        _require_local_secret(req)
 
         miners_raw = raw.get("miners", []) or []
         miners: List[MinerConfig] = []
         for m in miners_raw:
-            if not isinstance(m, dict):
+            if not m:
                 continue
             try:
-                miner_id = str(m.get("miner_id") or m.get("id") or m.get("ip"))
-                ip = str(m.get("ip"))
-                if not miner_id or not ip:
-                    continue
                 miners.append(MinerConfig(
-                    miner_id=miner_id,
-                    ip=ip,
-                    port=_as_positive_int(m.get("port", 4028), 4028, 1),
+                    miner_id=str(m.get("miner_id") or m.get("id") or m.get("ip")),
+                    ip=str(m.get("ip")),
+                    port=int(m.get("port", 4028)),
                     miner_type=str(m.get("miner_type") or m.get("type") or "antminer"),
                 ))
             except Exception:
                 continue
 
         # Handle older UI payloads that only provide poll_interval_sec.
-        poll = _as_positive_int(raw.get("poll_interval_sec", 60), 60, MIN_LATEST_INTERVAL_SEC)
-        latest = _as_positive_int(raw.get("latest_interval_sec", poll), poll, MIN_LATEST_INTERVAL_SEC)
-        raw_int = _as_positive_int(raw.get("raw_interval_sec", max(latest, 60)), max(latest, 60), MIN_RAW_INTERVAL_SEC)
+        poll = int(raw.get("poll_interval_sec", 60))
+        latest = int(raw.get("latest_interval_sec", poll))
+        raw_int = int(raw.get("raw_interval_sec", max(latest, 60)))
+        latest = max(MIN_LATEST_INTERVAL_SEC, latest)
+        raw_int = max(MIN_RAW_INTERVAL_SEC, raw_int)
 
-        shard_total = _as_positive_int(raw.get("shard_total", 1), 1, 1)
-        shard_index = _as_positive_int(raw.get("shard_index", 0), 0)
-        if shard_index >= shard_total:
+        shard_total = max(1, int(raw.get("shard_total", 1)))
+        shard_index = int(raw.get("shard_index", 0))
+        if shard_index < 0 or shard_index >= shard_total:
             shard_index = 0
 
-        local_api_secret = existing_cfg.local_api_secret
-        if "local_api_secret" in raw:
-            candidate_secret = str(raw.get("local_api_secret") or "").strip()
-            local_api_secret = candidate_secret
-
-        ip_ranges_raw = raw.get("ip_ranges", existing_cfg.ip_ranges or [])
+        current_cfg_dict = load_config()
+        current_cfg = AppConfig(**current_cfg_dict) if isinstance(current_cfg_dict, dict) else current_cfg_dict
+        current_secret = getattr(current_cfg, "local_api_secret", "")
 
         cfg = AppConfig(
-            site_id=str(raw.get("site_id", existing_cfg.site_id or "site_001")),
-            site_name=str(raw.get("site_name", existing_cfg.site_name or "")),
-            cloud_api_base=str(raw.get("cloud_api_base", existing_cfg.cloud_api_base or "")),
-            collector_token=str(raw.get("collector_token", existing_cfg.collector_token or "")),
+            site_id=str(raw.get("site_id", "site_001")),
+            site_name=str(raw.get("site_name", "")),
+            cloud_api_base=str(raw.get("cloud_api_base", "")),
+            collector_token=str(raw.get("collector_token", "")),
+            local_api_secret=str(current_secret or ""),
             latest_interval_sec=latest,
             raw_interval_sec=raw_int,
             poll_interval_sec=latest,
-            timeout_sec=_as_positive_float(raw.get("timeout_sec", existing_cfg.timeout_sec), existing_cfg.timeout_sec, 0.0),
-            max_retries=_as_positive_int(raw.get("max_retries", existing_cfg.max_retries), existing_cfg.max_retries, 0),
-            max_workers=_as_positive_int(raw.get("max_workers", existing_cfg.max_workers), existing_cfg.max_workers, 1),
-            batch_size=_as_positive_int(raw.get("batch_size", existing_cfg.batch_size), existing_cfg.batch_size, 1),
-            upload_connect_timeout_sec=_as_positive_float(
-                raw.get("upload_connect_timeout_sec", existing_cfg.upload_connect_timeout_sec),
-                existing_cfg.upload_connect_timeout_sec,
-                0.0,
-            ),
-            upload_read_timeout_sec=_as_positive_float(
-                raw.get("upload_read_timeout_sec", existing_cfg.upload_read_timeout_sec),
-                existing_cfg.upload_read_timeout_sec,
-                0.0,
-            ),
-            upload_workers=_as_positive_int(raw.get("upload_workers", existing_cfg.upload_workers), existing_cfg.upload_workers, 1),
-            latest_max_miners=_as_positive_int(raw.get("latest_max_miners", existing_cfg.latest_max_miners), existing_cfg.latest_max_miners, 1),
+            timeout_sec=float(raw.get("timeout_sec", 5)),
+            max_retries=int(raw.get("max_retries", 5)),
+            max_workers=int(raw.get("max_workers", 50)),
+            batch_size=int(raw.get("batch_size", 1000)),
+            upload_connect_timeout_sec=float(raw.get("upload_connect_timeout_sec", 2)),
+            upload_read_timeout_sec=float(raw.get("upload_read_timeout_sec", 30)),
+            upload_workers=int(raw.get("upload_workers", 4)),
+            latest_max_miners=int(raw.get("latest_max_miners", 500)),
             shard_total=shard_total,
             shard_index=shard_index,
-            miner_timeout_fast_sec=_as_positive_float(
-                raw.get("miner_timeout_fast_sec", existing_cfg.miner_timeout_fast_sec),
-                existing_cfg.miner_timeout_fast_sec,
-                0.0,
-            ),
-            miner_timeout_slow_sec=_as_positive_float(
-                raw.get("miner_timeout_slow_sec", existing_cfg.miner_timeout_slow_sec),
-                existing_cfg.miner_timeout_slow_sec,
-                0.0,
-            ),
-            offline_backoff_base_sec=_as_positive_int(raw.get("offline_backoff_base_sec", existing_cfg.offline_backoff_base_sec), existing_cfg.offline_backoff_base_sec, 0),
-            offline_backoff_max_sec=_as_positive_int(raw.get("offline_backoff_max_sec", existing_cfg.offline_backoff_max_sec), existing_cfg.offline_backoff_max_sec, 0),
-            enable_commands=_as_bool(raw.get("enable_commands", existing_cfg.enable_commands)),
-            command_poll_interval_sec=_as_positive_int(raw.get("command_poll_interval_sec", existing_cfg.command_poll_interval_sec), existing_cfg.command_poll_interval_sec, 1),
-            upload_ip_to_cloud=_as_bool(raw.get("upload_ip_to_cloud", existing_cfg.upload_ip_to_cloud)),
-            encrypt_miners_config=_as_bool(raw.get("encrypt_miners_config", existing_cfg.encrypt_miners_config)),
-            local_key_env=str(raw.get("local_key_env", existing_cfg.local_key_env or "PICKAXE_LOCAL_KEY")),
-            local_api_secret=local_api_secret,
+            miner_timeout_fast_sec=float(raw.get("miner_timeout_fast_sec", 1.5)),
+            miner_timeout_slow_sec=float(raw.get("miner_timeout_slow_sec", 5.0)),
+            offline_backoff_base_sec=int(raw.get("offline_backoff_base_sec", 30)),
+            offline_backoff_max_sec=int(raw.get("offline_backoff_max_sec", 300)),
+            enable_commands=bool(raw.get("enable_commands", False)),
+            command_poll_interval_sec=int(raw.get("command_poll_interval_sec", 5)),
+            upload_ip_to_cloud=raw.get("upload_ip_to_cloud", False) in (True, "true", "True", 1, "1"),
+            encrypt_miners_config=raw.get("encrypt_miners_config", False) in (True, "true", "True", 1, "1"),
+            local_key_env=str(raw.get("local_key_env", "PICKAXE_LOCAL_KEY")),
             miners=miners,
-            ip_ranges=list(ip_ranges_raw) if isinstance(ip_ranges_raw, list) else existing_cfg.ip_ranges,
+            ip_ranges=list(raw.get("ip_ranges", [])),
         )
 
         p = save_config(cfg, None)
-        return {"success": True, "config_path": str(p), "local_api_secret_set": bool(local_api_secret)}
+        return {"success": True, "config_path": str(p)}
 
     @app.post("/api/miners/test")
     def api_test_miners(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -657,7 +565,8 @@ def create_app() -> FastAPI:
         return {"start": start, "end": end, "total": total, "returned": len(ips), "ips": ips}
 
     @app.post("/api/collector/start")
-    def api_start(_auth: None = Depends(require_local_auth)) -> Dict[str, Any]:
+    def api_start(req: Request) -> Dict[str, Any]:
+        _require_local_secret(req)
         cfg = load_config(None)
         if not cfg.cloud_api_base or not cfg.collector_token:
             raise HTTPException(status_code=400, detail="cloud_api_base and collector_token are required")
@@ -668,15 +577,16 @@ def create_app() -> FastAPI:
         return runner.start(cfg)
 
     @app.post("/api/collector/stop")
-    def api_stop(_auth: None = Depends(require_local_auth)) -> Dict[str, Any]:
+    def api_stop(req: Request) -> Dict[str, Any]:
+        _require_local_secret(req)
         return runner.stop()
 
     @app.get("/api/status")
-    def api_status(_auth: None = Depends(require_local_auth)) -> Dict[str, Any]:
+    def api_status() -> Dict[str, Any]:
         return runner.status()
 
     @app.get("/api/logs", response_class=PlainTextResponse)
-    def api_logs(lines: int = 200, _auth: None = Depends(require_local_auth)) -> str:
+    def api_logs(lines: int = 200) -> str:
         return tail_file(log_file, lines=lines)
 
     return app
